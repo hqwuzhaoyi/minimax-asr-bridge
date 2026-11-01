@@ -29,6 +29,8 @@ struct AppState {
     http: reqwest::Client,
     upstream_base: String,
     upstream_model: String,
+    tts_model: String,
+    default_voice: String,
     minimax_key: String,
     /// Optional inbound bearer; when set, clients must present it.
     bridge_key: Option<String>,
@@ -49,6 +51,10 @@ async fn main() -> anyhow::Result<()> {
         .trim_end_matches('/')
         .to_string();
     let upstream_model = std::env::var("MINIMAX_MODEL").unwrap_or_else(|_| "asr-1.0".to_string());
+    let tts_model =
+        std::env::var("MINIMAX_TTS_MODEL").unwrap_or_else(|_| "speech-2.8-turbo".to_string());
+    let default_voice =
+        std::env::var("MINIMAX_VOICE").unwrap_or_else(|_| "female-shaonv".to_string());
     let bridge_key = std::env::var("BRIDGE_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
@@ -62,6 +68,8 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         upstream_base,
         upstream_model,
+        tts_model,
+        default_voice,
         minimax_key,
         bridge_key,
     };
@@ -79,6 +87,7 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/audio/transcriptions", post(transcribe))
         .route("/v1/audio/translations", post(transcribe))
+        .route("/v1/audio/speech", post(speech))
         .route("/healthz", get(health))
         .route("/", get(index))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -97,8 +106,8 @@ async fn health() -> &'static str {
 async fn index() -> Json<Value> {
     Json(json!({
         "service": "minimax-asr-bridge",
-        "endpoints": ["/v1/audio/transcriptions", "/v1/audio/translations"],
-        "upstream_model_env": "MINIMAX_MODEL (default asr-1.0)",
+        "endpoints": ["/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech"],
+        "upstream_model_env": "MINIMAX_MODEL (default asr-1.0), MINIMAX_TTS_MODEL (default speech-2.8-turbo)",
     }))
 }
 
@@ -301,6 +310,212 @@ fn openai_error(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
+// ---------------- TTS: OpenAI /v1/audio/speech -> MiniMax /v1/t2a_v2 ----------------
+
+#[derive(Debug, serde::Deserialize)]
+struct TtsRequest {
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>, // accepted and ignored; fixed by MINIMAX_TTS_MODEL
+    input: String,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    speed: Option<f64>,
+    #[serde(default)]
+    response_format: Option<String>,
+}
+
+/// Mirror the production Hermes wrapper's voice mapping: empty -> default,
+/// prefix `female-` unless already a known MiniMax voice id shape.
+fn normalize_voice(voice: Option<&str>, default: &str) -> String {
+    let v = voice
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| default.to_string());
+    if v.starts_with("female-")
+        || v.starts_with("male-")
+        || v == "presenter_female"
+        || v == "audiobook_female_1"
+    {
+        v
+    } else {
+        format!("female-{}", v)
+    }
+}
+
+const TTS_FORMATS: &[&str] = &["mp3", "wav", "flac", "pcm"];
+
+fn content_type_for(format: &str) -> &'static str {
+    match format {
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "pcm" => "audio/pcm",
+        _ => "audio/mpeg",
+    }
+}
+
+fn build_t2a_body(
+    model: &str,
+    input: &str,
+    voice: Option<&str>,
+    speed: Option<f64>,
+    default_voice: &str,
+    format: &str,
+) -> Value {
+    json!({
+        "model": model,
+        "text": input,
+        "stream": false,
+        "language_boost": "auto",
+        "output_format": "url",
+        "voice_setting": {
+            "voice_id": normalize_voice(voice, default_voice),
+            "speed": speed.unwrap_or(1.0).clamp(0.5, 2.0),
+            "vol": 1,
+            "pitch": 0,
+        },
+        "audio_setting": {
+            "sample_rate": 32000,
+            "bitrate": 128000,
+            "format": format,
+            "channel": 1,
+        },
+    })
+}
+
+async fn speech(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<TtsRequest>,
+) -> Response {
+    if let Err(resp) = check_inbound_auth(&state, &headers) {
+        return resp;
+    }
+    if req.input.trim().is_empty() {
+        return openai_error(StatusCode::BAD_REQUEST, "'input' is required");
+    }
+    let format = match req.response_format.as_deref().map(str::to_lowercase) {
+        None => "mp3".to_string(),
+        Some(f) if TTS_FORMATS.contains(&f.as_str()) => f,
+        Some(f) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported response_format '{f}' (supported: mp3, wav, flac, pcm)"),
+            );
+        }
+    };
+    tracing::info!(
+        bytes = req.input.len(),
+        voice = %normalize_voice(req.voice.as_deref(), &state.default_voice),
+        format = %format,
+        "speech request"
+    );
+
+    let body = build_t2a_body(
+        &state.tts_model,
+        &req.input,
+        req.voice.as_deref(),
+        req.speed,
+        &state.default_voice,
+        &format,
+    );
+    let url = format!("{}/v1/t2a_v2", state.upstream_base);
+    let resp = match state
+        .http
+        .post(&url)
+        .bearer_auth(&state.minimax_key)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "t2a_v2 request failed");
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream request failed: {e}"),
+            );
+        }
+    };
+    let status = resp.status();
+    let payload: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream returned non-JSON body (HTTP {status}): {e}"),
+            );
+        }
+    };
+
+    if let Some(base) = payload.get("base_resp") {
+        let code = base.get("status_code").and_then(Value::as_i64).unwrap_or(0);
+        if code != 0 {
+            let msg = base
+                .get("status_msg")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown upstream error");
+            tracing::warn!(code, "minimax t2a_v2 error");
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                format!("minimax error {code}: {msg}"),
+            );
+        }
+    }
+
+    let audio_url = match payload
+        .get("data")
+        .and_then(|d| d.get("audio"))
+        .and_then(Value::as_str)
+    {
+        Some(u) => u.to_string(),
+        None => {
+            tracing::warn!("t2a_v2 parse failure: no 'data.audio' URL");
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream response has no 'data.audio' URL",
+            );
+        }
+    };
+
+    let audio = match state.http.get(&audio_url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                format!("audio download failed with HTTP {}", r.status()),
+            );
+        }
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                format!("audio download failed: {e}"),
+            );
+        }
+    };
+    let content_type = audio
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| content_type_for(&format).to_string());
+    let bytes = match audio.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return openai_error(StatusCode::BAD_GATEWAY, format!("audio read failed: {e}"));
+        }
+    };
+    tracing::info!(bytes = bytes.len(), "speech served");
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, content_type)],
+        bytes,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +611,8 @@ mod tests {
             http: reqwest::Client::new(),
             upstream_base: format!("http://{addr}"),
             upstream_model: "asr-1.0".into(),
+            tts_model: "speech-2.8-turbo".into(),
+            default_voice: "female-shaonv".into(),
             minimax_key: "minimax-secret".into(),
             bridge_key: Some("bridge-key".into()),
         };
@@ -437,8 +654,145 @@ mod tests {
             http: reqwest::Client::new(),
             upstream_base: "http://127.0.0.1:1".into(),
             upstream_model: "asr-1.0".into(),
+            tts_model: "speech-2.8-turbo".into(),
+            default_voice: "female-shaonv".into(),
             minimax_key: "k".into(),
             bridge_key: Some("bridge-key".into()),
         }
+    }
+
+    #[test]
+    fn voice_normalization_matches_wrapper() {
+        assert_eq!(normalize_voice(None, "female-shaonv"), "female-shaonv");
+        assert_eq!(normalize_voice(Some(""), "female-shaonv"), "female-shaonv");
+        assert_eq!(
+            normalize_voice(Some("shaonv"), "female-shaonv"),
+            "female-shaonv"
+        );
+        assert_eq!(
+            normalize_voice(Some("FEMALE-Tianmei"), "female-shaonv"),
+            "female-tianmei"
+        );
+        assert_eq!(
+            normalize_voice(Some("male-qn-qingse"), "female-shaonv"),
+            "male-qn-qingse"
+        );
+        assert_eq!(
+            normalize_voice(Some("presenter_female"), "female-shaonv"),
+            "presenter_female"
+        );
+    }
+
+    #[test]
+    fn t2a_body_shape() {
+        let body = build_t2a_body(
+            "speech-2.8-turbo",
+            "你好",
+            Some("shaonv"),
+            Some(1.5),
+            "d",
+            "mp3",
+        );
+        assert_eq!(body["model"], "speech-2.8-turbo");
+        assert_eq!(body["voice_setting"]["voice_id"], "female-shaonv");
+        assert_eq!(body["voice_setting"]["speed"], 1.5);
+        assert_eq!(body["audio_setting"]["format"], "mp3");
+        assert_eq!(body["output_format"], "url");
+    }
+
+    #[tokio::test]
+    async fn end_to_end_speech_with_mock_upstream() {
+        // stub MiniMax t2a_v2 + audio URL on one server; the t2a stub embeds
+        // its own absolute audio URL (resolved after binding).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let audio_url = format!("http://{addr}/audio/x.mp3");
+        let upstream = Router::new()
+            .route(
+                "/v1/t2a_v2",
+                post(move |Json(body): Json<Value>| {
+                    let audio_url = audio_url.clone();
+                    async move {
+                        assert_eq!(body["model"], "speech-2.8-turbo");
+                        assert_eq!(body["voice_setting"]["voice_id"], "female-shaonv");
+                        Json(json!({"data": {"audio": audio_url}, "base_resp": {"status_code": 0}}))
+                    }
+                }),
+            )
+            .route(
+                "/audio/x.mp3",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "audio/mpeg")],
+                        Bytes::from_static(b"ID3DATA"),
+                    )
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = AppState {
+            http: reqwest::Client::new(),
+            upstream_base: format!("http://{addr}"),
+            upstream_model: "asr-1.0".into(),
+            tts_model: "speech-2.8-turbo".into(),
+            default_voice: "female-shaonv".into(),
+            minimax_key: "minimax-secret".into(),
+            bridge_key: None,
+        };
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "tts-1",
+                    "voice": "shaonv",
+                    "input": "你好世界",
+                    "response_format": "mp3"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"ID3DATA");
+        assert!(ct.starts_with("audio/"));
+    }
+
+    #[tokio::test]
+    async fn speech_rejects_empty_input() {
+        let app = router(test_state());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer bridge-key")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"input":"  "}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn speech_rejects_bad_format() {
+        let app = router(test_state());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer bridge-key")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"input":"hi","response_format":"opus"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

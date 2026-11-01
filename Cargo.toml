@@ -1,8 +1,8 @@
 [package]
 name = "minimax-asr-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "OpenAI-compatible /v1/audio/transcriptions endpoint backed by MiniMax asr-1.0"
+description = "OpenAI-compatible speech endpoints (/v1/audio/transcriptions, /v1/audio/speech) backed by MiniMax"
 license = "MIT"
 
 [dependencies]

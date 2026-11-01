@@ -1,12 +1,18 @@
 # minimax-asr-bridge
 
-A tiny OpenAI-compatible speech-to-text endpoint backed by **MiniMax `asr-1.0`**.
+OpenAI-compatible speech endpoints backed by **MiniMax** — ASR (`asr-1.0`)
+and TTS (`speech-2.8-turbo`) behind one tiny Rust + Tokio service.
 
 ```
 client ──POST /v1/audio/transcriptions (multipart)──▶ bridge
 bridge ──POST /v1/speech_to_text (multipart, asr-1.0)──▶ api.minimaxi.com
 bridge ◀──────────────────────── {"text": "..."} ────────┘
 client ◀──────────────────────── {"text": "..."} ────────┘
+
+client ──POST /v1/audio/speech {"input","voice"}────▶ bridge
+bridge ──POST /v1/t2a_v2 (speech-2.8-turbo)──────────▶ api.minimaxi.com
+bridge ◀──────────────────────── mp3 bytes ──────────────┘
+client ◀──────────────────────── mp3 bytes ──────────────┘
 ```
 
 Any client that speaks OpenAI's `/v1/audio/transcriptions` — the OpenAI SDKs,
@@ -30,6 +36,8 @@ binary, ~15 MB Docker image.
 | `MINIMAX_API_KEY`  | (required)                 | MiniMax platform API key                 |
 | `MINIMAX_API_BASE` | `https://api.minimaxi.com` | MiniMax API base (international host)    |
 | `MINIMAX_MODEL`    | `asr-1.0`                  | Upstream ASR model                       |
+| `MINIMAX_TTS_MODEL`| `speech-2.8-turbo`         | Upstream TTS model                       |
+| `MINIMAX_VOICE`    | `female-shaonv`            | Default TTS voice when client omits one  |
 | `BRIDGE_API_KEY`   | (unset = open)             | Require inbound `Authorization: Bearer`  |
 | `LISTEN_ADDR`      | `0.0.0.0:8090`             | Listen address                           |
 
@@ -41,6 +49,10 @@ binary, ~15 MB Docker image.
   `response_format`/`x-response-format: verbose_json` returns
   `{"task", "language", "duration", "text", "segments"}`.
 - `POST /v1/audio/translations` — same handler, for SDKs that POST there.
+- `POST /v1/audio/speech` — OpenAI TTS JSON format (`input` required;
+  `voice` is normalized the same way as MiniMax's own clients, `speed`
+  clamped to 0.5–2.0, `response_format` ∈ `mp3|wav|flac|pcm`). Returns raw
+  audio bytes.
 - `GET /healthz` — liveness.
 
 Upstream MiniMax errors (`base_resp.status_code != 0`) are surfaced as
