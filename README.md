@@ -1,4 +1,4 @@
-# minimax-asr-bridge
+# voice-gateway
 
 OpenAI-compatible speech endpoints backed by **MiniMax** — ASR (`asr-1.0`)
 and TTS (`speech-2.8-turbo`) behind one tiny Rust + Tokio service.
@@ -65,8 +65,8 @@ circuit-breaker logic keeps working.
 export MINIMAX_API_KEY=...
 cargo run --release
 # or
-docker build -t minimax-asr-bridge . && docker run --rm -p 8090:8090 \
-  -e MINIMAX_API_KEY=... minimax-asr-bridge
+docker build -t voice-gateway . && docker run --rm -p 8090:8090 \
+  -e MINIMAX_API_KEY=... voice-gateway
 ```
 
 Point your client at `http://<host>:8090/v1` as an OpenAI-compatible provider
