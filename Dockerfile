@@ -6,8 +6,8 @@ COPY src ./src
 RUN cargo build --release
 
 FROM gcr.io/distroless/cc-debian12
-COPY --from=build /src/target/release/minimax-asr-bridge /usr/local/bin/minimax-asr-bridge
+COPY --from=build /src/target/release/voice-gateway /usr/local/bin/voice-gateway
 ENV LISTEN_ADDR=0.0.0.0:8090
 EXPOSE 8090
 USER nonroot:nonroot
-ENTRYPOINT ["/usr/local/bin/minimax-asr-bridge"]
+ENTRYPOINT ["/usr/local/bin/voice-gateway"]

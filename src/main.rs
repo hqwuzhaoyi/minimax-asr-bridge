@@ -1,4 +1,4 @@
-//! minimax-asr-bridge — an OpenAI-compatible `/v1/audio/transcriptions`
+//! voice-gateway — an OpenAI-compatible `/v1/audio/transcriptions`
 //! endpoint backed by MiniMax `asr-1.0` (`/v1/speech_to_text`).
 //!
 //! Lets any OpenAI-SDK-speaking client (e.g. self-hosted memos voice
@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("MINIMAX_TTS_MODEL").unwrap_or_else(|_| "speech-2.8-turbo".to_string());
     let default_voice =
         std::env::var("MINIMAX_VOICE").unwrap_or_else(|_| "female-shaonv".to_string());
-    let bridge_key = std::env::var("BRIDGE_API_KEY")
+    let bridge_key = std::env::var("GATEWAY_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
     let listen: SocketAddr = std::env::var("LISTEN_ADDR")
@@ -105,7 +105,7 @@ async fn health() -> &'static str {
 
 async fn index() -> Json<Value> {
     Json(json!({
-        "service": "minimax-asr-bridge",
+        "service": "voice-gateway",
         "endpoints": ["/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech"],
         "upstream_model_env": "MINIMAX_MODEL (default asr-1.0), MINIMAX_TTS_MODEL (default speech-2.8-turbo)",
     }))

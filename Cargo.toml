@@ -1,5 +1,5 @@
 [package]
-name = "minimax-asr-bridge"
+name = "voice-gateway"
 version = "0.2.0"
 edition = "2021"
 description = "OpenAI-compatible speech endpoints (/v1/audio/transcriptions, /v1/audio/speech) backed by MiniMax"

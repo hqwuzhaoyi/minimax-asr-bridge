@@ -38,7 +38,7 @@ binary, ~15 MB Docker image.
 | `MINIMAX_MODEL`    | `asr-1.0`                  | Upstream ASR model                       |
 | `MINIMAX_TTS_MODEL`| `speech-2.8-turbo`         | Upstream TTS model                       |
 | `MINIMAX_VOICE`    | `female-shaonv`            | Default TTS voice when client omits one  |
-| `BRIDGE_API_KEY`   | (unset = open)             | Require inbound `Authorization: Bearer`  |
+| `GATEWAY_API_KEY`   | (unset = open)             | Require inbound `Authorization: Bearer`  |
 | `LISTEN_ADDR`      | `0.0.0.0:8090`             | Listen address                           |
 
 ## Endpoints
